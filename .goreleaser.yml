@@ -16,18 +16,13 @@ builds:
 archive:
   replacements:
     darwin: macOS
-    386: i386
-    amd64: x86_64
   wrap_in_directory: true
   format_overrides:
     - goos: windows
       format: zip
 checksum:
   name_template: 'checksums.txt'
-snapshot:
-  name_template: "{{ .Tag }}-next"
 changelog:
-  sort: asc
   filters:
     exclude:
     - '^docs:'
