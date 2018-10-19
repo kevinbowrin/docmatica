@@ -34,11 +34,17 @@ func init() {
 		fmt.Fprintln(os.Stderr, "- All .rst files are nested within chapter directories, except:")
 		fmt.Fprintln(os.Stderr, "    * index.rst files, which can be in the root of manuals or the root of the repository.")
 		fmt.Fprintln(os.Stderr, "    * contents.rst files, which can be in the root of the repository.")
+		fmt.Fprintln(os.Stderr, "- All .rst files have 'Back to Top' anchors.")
+		fmt.Fprintln(os.Stderr, "\nCommand line arguments:\n")
 		flag.PrintDefaults()
 	}
 }
 
 func main() {
+
+	// Process the flags.
+	flag.Parse()
+
 	// Get the current working directory.
 	wd, err := os.Getwd()
 	if err != nil {
@@ -215,13 +221,13 @@ func checkFileContent(path string, lintErrors chan<- pathError) error {
 
 	anchorLines := make(chan string)
 	anchorError := make(chan error, 1)
-	defer close(anchorLines)
 	go checkAnchors(anchorLines, anchorError)
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		anchorLines <- scanner.Text()
 	}
+	close(anchorLines)
 	err, errValid := <-anchorError
 	if errValid {
 		lintErrors <- pathError{path: path, err: err}
@@ -239,7 +245,6 @@ func checkAnchors(lines <-chan string, errC chan<- error) {
 	firstLine := true
 	foundAnchor := false
 	matchingAnchor := false
-	textAfterMatchingAnchor := false
 	anchorText := ""
 	for line := range lines {
 		fields := strings.Fields(line)
@@ -259,20 +264,12 @@ func checkAnchors(lines <-chan string, errC chan<- error) {
 					matchingAnchor = true
 				}
 			}
-			if matchingAnchor {
-				if fields[0] != ".." ||
-					fields[1][0:1] != "_" {
-					textAfterMatchingAnchor = true
-				}
-			}
 		}
 	}
 	if !foundAnchor {
 		errC <- errors.New("Anchor not found at top of page.")
 	} else if !matchingAnchor {
 		errC <- errors.New("'Back to top' link to anchor not found.")
-	} else if textAfterMatchingAnchor {
-		errC <- errors.New("Something other than links found after 'Back to top' link.")
 	}
 }
 
