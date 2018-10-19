@@ -18,7 +18,7 @@ type pathError struct {
 }
 
 var (
-	docRoot = flag.String("db", "", "The path to the directory you want to run the tool on. "+
+	pathFlag = flag.String("path", "", "The path to the directory you want to run the tool on. "+
 		"If not provided, the current working directory will be used.")
 	// A version flag, which should be overwritten when building using ldflags.
 	version = "devel"
@@ -45,10 +45,15 @@ func main() {
 	// Process the flags.
 	flag.Parse()
 
-	// Get the current working directory.
-	wd, err := os.Getwd()
-	if err != nil {
-		log.Fatalf("Error: Unable to get current working directory, exiting. %v", err)
+	root := *pathFlag
+
+	if root == "" {
+		// Get the current working directory.
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Error: Unable to get current working directory, exiting. %v", err)
+		}
+		root = wd
 	}
 
 	// The tool spins up a new goroutine per file.
@@ -69,11 +74,11 @@ func main() {
 		"conf.py",
 	}
 
-	// Recursively search the working directory and all subdirectories.
+	// Recursively search the root directory and all subdirectories.
 	// Ignore files starting with "."
-	err = filepath.Walk(wd, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 
-		rpath := relPath(path, wd)
+		rpath := relPath(path, root)
 
 		// If an error occurred accessing this path, print it but don't stop processing.
 		if err != nil {
@@ -127,7 +132,7 @@ func main() {
 	go func() {
 		tripwire := false
 		for pe := range lintErrors {
-			fmt.Printf("%v: %v\n", relPath(pe.path, wd), pe.err)
+			fmt.Printf("%v: %v\n", relPath(pe.path, root), pe.err)
 			tripwire = true
 		}
 
@@ -273,9 +278,9 @@ func checkAnchors(lines <-chan string, errC chan<- error) {
 	}
 }
 
-// Make a relative path from the current working directory and the current path.
-func relPath(path, wd string) string {
-	return fmt.Sprintf(".%v", strings.TrimPrefix(path, wd))
+// Make a relative path from the current root and the current path.
+func relPath(path, root string) string {
+	return fmt.Sprintf(".%v", strings.TrimPrefix(path, root))
 }
 
 // Get the name of the directory above the end of the path.
