@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -11,9 +12,30 @@ import (
 	"sync"
 )
 
-type PathError struct {
-	Path string
-	Err  error
+type pathError struct {
+	path string
+	err  error
+}
+
+var (
+	docRoot = flag.String("db", "", "The path to the directory you want to run the tool on. "+
+		"If not provided, the current working directory will be used.")
+	// A version flag, which should be overwritten when building using ldflags.
+	version = "devel"
+)
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Docmatica\nVersion %v\n\n", version)
+		fmt.Fprintln(os.Stderr, "A linter for archivematica-docs.")
+		fmt.Fprintln(os.Stderr, "This tool works best when run at the root of the archivematica-docs repository.")
+		fmt.Fprintln(os.Stderr, "The following checks will be performed:")
+		fmt.Fprintln(os.Stderr, "- All files found have extension .rst or .svg or .png in an images directory.")
+		fmt.Fprintln(os.Stderr, "- All .rst files are nested within chapter directories, except:")
+		fmt.Fprintln(os.Stderr, "    * index.rst files, which can be in the root of manuals or the root of the repository.")
+		fmt.Fprintln(os.Stderr, "    * contents.rst files, which can be in the root of the repository.")
+		flag.PrintDefaults()
+	}
 }
 
 func main() {
@@ -28,7 +50,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	// The linter functions can send errors to this channel.
-	lintErrors := make(chan PathError)
+	lintErrors := make(chan pathError)
 
 	// These are the names of files we can ignore
 	// when we're in the "archivematica-docs" directory.
@@ -93,13 +115,13 @@ func main() {
 		log.Printf("Warning: File access error during recursive search. %v", err)
 	}
 
-	anyErrors := make(chan bool)
+	anyErrors := make(chan bool, 1)
 
 	// This goroutine prints any errors that into the lintErrors channel.
 	go func() {
 		tripwire := false
 		for pe := range lintErrors {
-			fmt.Printf("%v: %v\n", relPath(pe.Path, wd), pe.Err)
+			fmt.Printf("%v: %v\n", relPath(pe.path, wd), pe.err)
 			tripwire = true
 		}
 
@@ -122,20 +144,20 @@ func main() {
 	}
 }
 
-func check(path string, info os.FileInfo, wg *sync.WaitGroup, lintErrors chan<- PathError) {
+func check(path string, info os.FileInfo, wg *sync.WaitGroup, lintErrors chan<- pathError) {
 	defer wg.Done()
 	err := checkFileType(path, info)
 	if err != nil {
-		lintErrors <- PathError{Path: path, Err: err}
+		lintErrors <- pathError{path: path, err: err}
 	}
 	if filepath.Ext(path) == ".rst" {
 		err = checkRstInChapters(path, info)
 		if err != nil {
-			lintErrors <- PathError{Path: path, Err: err}
+			lintErrors <- pathError{path: path, err: err}
 		}
-		err = checkAnchors(path, info)
+		err = checkFileContent(path, lintErrors)
 		if err != nil {
-			lintErrors <- PathError{Path: path, Err: err}
+			lintErrors <- pathError{path: path, err: err}
 		}
 	}
 }
@@ -164,56 +186,94 @@ func checkFileType(path string, info os.FileInfo) error {
 // index.rst - the main index for the documentation, which acts as the homepage
 func checkRstInChapters(path string, info os.FileInfo) error {
 	if parent(path) != "archivematica-docs" &&
-		parent(path) != "user-manual" &&
+		parent(path) != "admin-manual" &&
 		parent(path) != "getting-started" &&
-		parent(path) != "admin-manual" {
+		parent(path) != "user-manual" &&
+		parent(path) != "images" {
 		return nil
 	}
-	if info.Name() == "index.rst" {
+	if parent(path) == "archivematica-docs" &&
+		(info.Name() == "index.rst" || info.Name() == "contents.rst") {
 		return nil
 	}
-	if parent(path) == "archivematica-docs" && info.Name() == "contents.rst" {
+	if (parent(path) == "admin-manual" ||
+		parent(path) == "getting-started" ||
+		parent(path) == "user-manual") &&
+		info.Name() == "index.rst" {
 		return nil
 	}
 
 	return errors.New("Not found in chapter directory.")
 }
 
-// checkAnchors ensures all pages begin with an anchor and have a back to the top link
-// at the bottom of the page, which refers to the page anchor.
-func checkAnchors(path string, info os.FileInfo) error {
+func checkFileContent(path string, lintErrors chan<- pathError) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	firstLine := true
-	foundAnchor := false
+	anchorLines := make(chan string)
+	anchorError := make(chan error, 1)
+	defer close(anchorLines)
+	go checkAnchors(anchorLines, anchorError)
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		if firstLine {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) == 2 &&
-				fields[0] == ".." &&
-				fields[1][0:1] == "_" &&
-				fields[1][len(fields[1])-1:] == ":" {
-				foundAnchor = true
-			}
-		}
-		firstLine = false
+		anchorLines <- scanner.Text()
+	}
+	err, errValid := <-anchorError
+	if errValid {
+		lintErrors <- pathError{path: path, err: err}
 	}
 	if err := scanner.Err(); err != nil {
 		return err
 	}
+	return nil
+}
 
-	if foundAnchor {
-		return nil
+// checkAnchors ensures all pages begin with an anchor and have a back to the top link
+// at the bottom of the page, which refers to the page anchor.
+func checkAnchors(lines <-chan string, errC chan<- error) {
+	defer close(errC)
+	firstLine := true
+	foundAnchor := false
+	matchingAnchor := false
+	textAfterMatchingAnchor := false
+	anchorText := ""
+	for line := range lines {
+		fields := strings.Fields(line)
+		if firstLine {
+			if len(fields) == 2 &&
+				fields[0] == ".." &&
+				fields[1][0:1] == "_" &&
+				fields[1][len(fields[1])-1:] == ":" {
+				anchorText = fields[1][1 : len(fields[1])-1]
+				foundAnchor = true
+			}
+			firstLine = false
+		}
+		if foundAnchor {
+			if !matchingAnchor {
+				if line == fmt.Sprintf(":ref:`Back to the top <%v>`", anchorText) {
+					matchingAnchor = true
+				}
+			}
+			if matchingAnchor {
+				if fields[0] != ".." ||
+					fields[1][0:1] != "_" {
+					textAfterMatchingAnchor = true
+				}
+			}
+		}
 	}
-
-	return errors.New("Anchor not found on first line.")
-
+	if !foundAnchor {
+		errC <- errors.New("Anchor not found at top of page.")
+	} else if !matchingAnchor {
+		errC <- errors.New("'Back to top' link to anchor not found.")
+	} else if textAfterMatchingAnchor {
+		errC <- errors.New("Something other than links found after 'Back to top' link.")
+	}
 }
 
 // Make a relative path from the current working directory and the current path.
